@@ -452,8 +452,6 @@ def mamba_mimo_fwd(
                 T.gemm(q_shared, k_shared, qk_intrachunk_frag, transpose_B=True, clear_accum=True)
 
                 # Strictly causal mask over chunk steps (exclude same-step diagonal).
-                da_cs__or__exp_da_cs_shared = T.alloc_shared([chunk_size], T.float32)
-                T.copy(DA_CS[i_b, i_h, chunk_start:chunk_start+chunk_size], da_cs__or__exp_da_cs_shared)
                 qk_intrachunk_masked_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], dtype=dtype)
                 for csr_i, csr_j in T.Parallel(fused_chunk_size, fused_chunk_size):
                     qk_intrachunk_masked_frag[csr_i, csr_j] = T.if_then_else(
@@ -463,12 +461,10 @@ def mamba_mimo_fwd(
                                                 0.0
                                             )
 
-                # Exponentiate da_cs__or__exp_da_cs_shared so that later usage does not have to:
-                for cs in T.Parallel(chunk_size):
-                    da_cs__or__exp_da_cs_shared[cs] = T.exp(da_cs__or__exp_da_cs_shared[cs])
-
                 exp_da_cs_frag = T.alloc_fragment([chunk_size], dtype=T.float32)
-                T.copy(da_cs__or__exp_da_cs_shared, exp_da_cs_frag)
+                T.copy(DA_CS[i_b, i_h, chunk_start:chunk_start+chunk_size], exp_da_cs_frag)
+                for cs in T.Parallel(chunk_size):
+                    exp_da_cs_frag[cs] = T.exp(exp_da_cs_frag[cs])
                 for csr, p in T.Parallel(fused_chunk_size, P):
                     o_mimo_accum_frag[csr, p] *= exp_da_cs_frag[csr//R]
 
