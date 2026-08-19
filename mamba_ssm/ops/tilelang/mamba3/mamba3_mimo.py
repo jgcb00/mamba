@@ -453,7 +453,7 @@ def mamba3_mimo_varlen_grouped(
     dtype: torch.dtype,
     cu_seqlens: Tensor,
     Input_States: Optional[Tuple[Tensor, Tensor, Tensor, Tensor]] = None,
-    group_tokens: int = 2048,
+    group_tokens: int = 1536,
     min_split_tokens: int = 4096,
     cu_seqlens_cpu: Optional[Tensor] = None,
     fuse_pregate_headwise_rms_norm: bool = False,
@@ -559,17 +559,18 @@ def mamba3_mimo_varlen_grouped(
         Angles, DT, init_state=None, chunk_size=chunk_size,
         return_output_state=True, cu_seqlens=v_cu,
     )
-    ang_in = torch.zeros_like(ang_local)
-    run = None
-    prev_seq = -1
-    for g in range(nsv):
-        s = seq_of_group[g]
-        if s != prev_seq:
-            prev_seq = s
-            run = In_Angle[s].float() if In_Angle is not None \
-                else torch.zeros_like(ang_local[0])
-        ang_in[g] = run
-        run = torch.remainder(run + ang_local[g], TWO_PI)
+    # Phase offsets have no decay, so the chain is an exclusive cumsum per
+    # true sequence (group phases are bounded by the kernel's mod 2*pi, and
+    # there are few groups, so fp32 cumsum is exact enough).
+    first_rows = [0] + [last_group_rows[s - 1] + 1 for s in range(1, ns_true)]
+    ang_in = torch.empty_like(ang_local)
+    for s in range(ns_true):
+        sl = slice(first_rows[s], last_group_rows[s] + 1)
+        base = In_Angle[s].float() if In_Angle is not None \
+            else torch.zeros_like(ang_local[0])
+        excl = torch.cat([torch.zeros_like(ang_local[:1]),
+                          torch.cumsum(ang_local[sl][:-1], dim=0)])
+        ang_in[sl] = torch.remainder(base + excl, TWO_PI)
     Angles_Cumsum, ang_state2 = angle_dt_fwd(
         Angles, DT, init_state=ang_in, chunk_size=chunk_size,
         return_output_state=True, cu_seqlens=v_cu,
@@ -578,12 +579,12 @@ def mamba3_mimo_varlen_grouped(
     DA_CS, DA_CS_REV, Segsum = compute_dacs_segsum_triton_varlen(
         ADT, chunk_size, cu_seqlens=v_cu)
 
-    # ---- pass 1: local group states (zero input) ----------------------------
+    # ---- pass 1: local group states only (zero input, no output compute) ----
     _, h1, k1 = mamba_mimo_forward_varlen(
         Q, K, V, Q_bias, K_bias, MIMO_V, MIMO_Out, Z, D, MIMO_Z,
         Angles_Cumsum, DA_CS, DA_CS_REV, DT, Trap, Segsum,
         chunk_size, rotary_dim_divisor, dtype, cu_seqlens=v_cu,
-        return_state=True, initial_states=None,
+        return_state=True, initial_states=None, compute_outputs=False,
         fuse_pregate_headwise_rms_norm=fuse_pregate_headwise_rms_norm,
         outproj_norm_weight=outproj_norm_weight,
         outproj_norm_eps=outproj_norm_eps,
@@ -614,25 +615,29 @@ def mamba3_mimo_varlen_grouped(
     k_in = torch.zeros(nsv, R_, H_, N_, device=dev, dtype=k1.dtype)
     v_in = torch.zeros(nsv, H_, P_, device=dev, dtype=V.dtype)
 
-    prev_seq = -1
-    state = None
-    for g in range(nsv):
-        s = seq_of_group[g]
-        if s != prev_seq:  # first group of a sequence
-            prev_seq = s
-            if In_SSM is not None:
-                ssm_in[g] = In_SSM[s].float().transpose(-1, -2)  # [H,P,N]->[H,N,P]
-                k_in[g] = In_K[s]
-                v_in[g] = In_V[s]
-        else:
-            ssm_in[g] = state
-            k_in[g] = k1[g - 1]
-            v_in[g] = V[0, v_bounds[g] - 1]
-        # effective folded input the kernel will build for group g
-        fold = torch.einsum("rhn,hp,hrp,h->hnp",
-                            k_in[g].float(), v_in[g].float(),
-                            mimo_v_f, bscale[g])
-        state = h1[g] + decay[g].view(H_, 1, 1) * (ssm_in[g] + fold)
+    # k/v inputs are state-independent, so they are known for every group up
+    # front: pass-1 finals for continuation groups, Input_States for firsts.
+    first_set = set(first_rows)
+    cont = [g for g in range(nsv) if g not in first_set]
+    if cont:
+        cont_t = torch.tensor(cont, device=dev, dtype=torch.long)
+        k_in[cont_t] = k1[cont_t - 1]
+        v_in[cont_t] = V[0, torch.tensor([v_bounds[g] - 1 for g in cont],
+                                         device=dev, dtype=torch.long)]
+    if In_SSM is not None:
+        fr = torch.tensor(first_rows, device=dev, dtype=torch.long)
+        ssm_in[fr] = In_SSM.float().transpose(-1, -2)  # [NS,H,P,N]->[NS,H,N,P]
+        k_in[fr] = In_K
+        v_in[fr] = In_V
+
+    # pre[g] = local_final + decay * folded_kv; only the scalar-decay affine
+    # accumulation stays sequential (one addcmul per group).
+    fold = torch.einsum("grhn,ghp,hrp,gh->ghnp",
+                        k_in.float(), v_in.float(), mimo_v_f, bscale)
+    pre = h1 + decay.view(nsv, H_, 1, 1) * fold
+    for g in cont:
+        ssm_in[g] = torch.addcmul(pre[g - 1],
+                                  decay[g - 1].view(H_, 1, 1), ssm_in[g - 1])
 
     # ---- pass 2: exact outputs with chained input states --------------------
     o2, h2, k2 = mamba_mimo_forward_varlen(
