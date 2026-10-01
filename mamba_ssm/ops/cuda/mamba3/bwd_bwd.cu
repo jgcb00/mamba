@@ -166,10 +166,12 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_bwd_kernel(const Args a) {
   float rs_dt = 0.f, rs_tr = 0.f, rs_dts = 0.f, rs_trs = 0.f, rs_er = 0.f, rs_ec = 0.f;
   auto load_scalars = [&](int ci_n) {
     const int c0n = seg_s0 + ci_n * C;
-    if (t < C) {
+    if (t < C) {   // tokens past S read as 0 (TileLang's guarded loads); past the last head's row they would be garbage
       const size_t o = (size_t)h * a.S + c0n + t;
-      rs_dt = __ldg(a.dt + o); rs_tr = bf(a.trap[o]); rs_er = __ldg(a.da_cs_rev + o); rs_ec = __ldg(a.da_cs + o);
-      if (c0n + t + 1 < a.S) { rs_dts = __ldg(a.dt + o + 1); rs_trs = bf(a.trap[o + 1]); } else { rs_dts = 0.f; rs_trs = 0.f; }
+      const bool ok = c0n + t < a.S, ok1 = c0n + t + 1 < a.S;
+      rs_dt = ok ? __ldg(a.dt + o) : 0.f; rs_tr = ok ? bf(a.trap[o]) : 0.f;
+      rs_er = ok ? __ldg(a.da_cs_rev + o) : 0.f; rs_ec = ok ? __ldg(a.da_cs + o) : 0.f;
+      rs_dts = ok1 ? __ldg(a.dt + o + 1) : 0.f; rs_trs = ok1 ? bf(a.trap[o + 1]) : 0.f;
     }
   };
   if (blk_nch > 0) { issue_inputs(blk_c0 + blk_nch - 1); load_scalars(blk_c0 + blk_nch - 1); }
@@ -676,23 +678,23 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_bwd_kernel(const Args a) {
   }
   if (!a.state_only) {
     __syncthreads();
-    float* red = reinterpret_cast<float*>(s.q);
-    for (int i = t; i < R * P; i += THREADS) red[i] = 0.f;
-    __syncthreads();
+    // deterministic dMIMO_V: one writer per (slab, r, p), then a fixed-order sum over the 4 slabs
+    float* red = reinterpret_cast<float*>(s.q);   // [4 slabs][R * P]
 #pragma unroll
     for (int nt = 0; nt < 4; ++nt)
 #pragma unroll
       for (int j = 0; j < 2; ++j) {
         float v = dPsi[nt][j];
         v += __shfl_xor_sync(0xffffffffu, v, 16);
-        if ((lane & 16) == 0) atomicAdd(&red[r_own * P + pc0 + nt * 8 + 2 * qd + j], v);
+        if ((lane & 16) == 0) red[slab * R * P + r_own * P + pc0 + nt * 8 + 2 * qd + j] = v;
       }
     float dd = dD;
 #pragma unroll
     for (int o = 16; o; o >>= 1) dd += __shfl_xor_sync(0xffffffffu, dd, o);
     if (lane == 0) s.red2[warp] = dd;
     __syncthreads();
-    for (int i = t; i < R * P; i += THREADS) a.dmimo_v[((size_t)h * a.nblk_dim + blk) * R * P + i] = red[i];
+    for (int i = t; i < R * P; i += THREADS)
+      a.dmimo_v[((size_t)h * a.nblk_dim + blk) * R * P + i] = ((red[i] + red[R * P + i]) + red[2 * R * P + i]) + red[3 * R * P + i];
     if (t == 0) {
       float s8 = 0.f;
       for (int w = 0; w < 8; ++w) s8 += s.red2[w];
