@@ -60,7 +60,9 @@ def _reduce_grouped_qk_grads_and_bias_partial_kernel(
     pid_g = pid_gn // N_BLOCKS
     pid_n = pid_gn - pid_g * N_BLOCKS
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # int64: raw_offsets scale as offs_m * R * H * N and pass 2^31 once
+    # B*S exceeds ~87k rows (e.g. R*H*N = 24,576 -> overflow at 87,381 rows).
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = (offs_m[:, None] < TOTAL_ROWS) & (offs_n[None, :] < N)
 
