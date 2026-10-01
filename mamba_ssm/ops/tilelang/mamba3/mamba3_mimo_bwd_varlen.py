@@ -45,6 +45,7 @@ import argparse
 from typing import Optional, Tuple
 
 from mamba_ssm.ops.triton.mamba3.mamba3_mimo_utils import bwd_dadt_fused_triton_varlen, bwd_dtrap_ddt_triton_varlen
+from mamba_ssm.ops.cuda.mamba3.bwd_bwd import cuda_bwd_bwd
 from mamba_ssm.ops.triton.mamba3.grouped_head_reduction import (
     reduce_grouped_qk_grads_and_bias_triton,
 )
@@ -1735,6 +1736,12 @@ def mamba_mimo_bwd_combined_varlen(
     bwd_bwd_hasZ = (z is not None) and not fuse_pregate_headwise_rms_norm
     bwd_bwd_packed_dout = fuse_pregate_headwise_rms_norm
     def _make_bwd_bwd(**flags):
+        cuda_kernel = cuda_bwd_bwd(
+            B, H, G, N, P, R, bwd_bwd_hasZ, D is not None, bwd_bwd_reduceO, bwd_bwd_packed_dout,
+            isVarlen=cu_seqlens is not None, chunk_size=chunk_size, rotary_dim_divisor=rotary_dim_divisor,
+            dtype=dtype_str, states_dtype=states_dtype, **flags)
+        if cuda_kernel is not None:
+            return cuda_kernel
         return mamba_mimo_bwd_bwd(
             B, H, G,
             N, P, R,
