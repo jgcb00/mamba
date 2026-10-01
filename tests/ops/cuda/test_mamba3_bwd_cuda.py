@@ -1,4 +1,4 @@
-"""The opt-in CUDA bwd_bwd (M3_CUDA_BWD=1) against an fp64 autograd reference, next to the TileLang kernel:
+"""The opt-in CUDA backward kernels (M3_CUDA_BWD=1: bwd_fwd + bwd_bwd) against an fp64 autograd reference, next to the TileLang kernel:
 it must be finite on ragged packings (chunk tails at the end of the buffer), bitwise deterministic, and at
 least as accurate as TileLang."""
 import importlib.util
@@ -60,10 +60,10 @@ def _reference(x):
     g = torch.autograd.grad(out, [leaves[kk] for kk in keys], x["dout"].double())
     m = dict(zip(keys, g))
     return dict(dq=m["q"], dk=m["k"], dv=m["v"], dangles=m["angles"], ddt=m["dt"], dtrap=m["trap"], dq_bias=m["q_bias"],
-                dk_bias=m["k_bias"], dmimo_v=m["mimo_v"], dz=m["z"])
+                dk_bias=m["k_bias"], dmimo_v=m["mimo_v"], dmimo_o=m["mimo_o"], dmimo_z=m["mimo_z"], dz=m["z"])
 
 
-def test_cuda_bwd_bwd_finite_deterministic_and_as_accurate_as_tilelang():
+def test_cuda_bwd_finite_deterministic_and_as_accurate_as_tilelang():
     x = _inputs()
     ref = _reference(x)
     tl, cu1, cu2 = _bwd(x, False), _bwd(x, True), _bwd(x, True)

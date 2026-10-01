@@ -46,6 +46,7 @@ from typing import Optional, Tuple
 
 from mamba_ssm.ops.triton.mamba3.mamba3_mimo_utils import bwd_dadt_fused_triton_varlen, bwd_dtrap_ddt_triton_varlen
 from mamba_ssm.ops.cuda.mamba3.bwd_bwd import cuda_bwd_bwd
+from mamba_ssm.ops.cuda.mamba3.bwd_fwd import cuda_bwd_fwd
 from mamba_ssm.ops.triton.mamba3.grouped_head_reduction import (
     reduce_grouped_qk_grads_and_bias_triton,
 )
@@ -1688,6 +1689,12 @@ def mamba_mimo_bwd_combined_varlen(
     qk_dot = torch.zeros([B, H, S, R, R], dtype=q.dtype, device=q.device)
 
     def _make_bwd_fwd(**flags):
+        cuda_kernel = cuda_bwd_fwd(
+            B, H, G, N, P, R, z is not None, D is not None, reduceO, fuse_pregate_headwise_rms_norm,
+            isVarlen=cu_seqlens is not None, chunk_size=chunk_size, rotary_dim_divisor=rotary_dim_divisor,
+            dtype=dtype_str, states_dtype=states_dtype, **flags)
+        if cuda_kernel is not None:
+            return cuda_kernel
         return mamba_mimo_bwd_fwd(
             B, H, G,
             N, P, R,
