@@ -140,7 +140,7 @@ def reduce_grouped_qk_grads_and_bias_triton(
     dq_raw: torch.Tensor,
     dk_raw: torch.Tensor,
     num_qk_groups: int,
-    block_m: int = 64,
+    block_m: int = 256,
     block_n: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reduce raw per-value-head Q/K grads and compute Q/K bias grads in one pass.
@@ -169,8 +169,11 @@ def reduce_grouped_qk_grads_and_bias_triton(
     total_rows = B * S
     group_size = H // num_qk_groups
     num_row_blocks = triton.cdiv(total_rows, block_m)
+    # 256 x 64 tiles: each row's N values load as wide contiguous segments and
+    # the per-row-block bias partials stay small. GH200, S=65536 R=4 H=12
+    # N=128 bf16: 1.73 ms (64 x 16, 1.0 TB/s) -> 0.69 ms (2.5 TB/s).
     if block_n is None:
-        block_n = min(16, _next_power_of_2(N))
+        block_n = min(64, _next_power_of_2(N))
     block_n = max(1, block_n)
 
     dq_bias_partial = torch.empty(

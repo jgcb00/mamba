@@ -31,6 +31,7 @@ path untouched, so this is reversible without redeploying code.
 """
 
 import os
+import weakref
 
 import torch
 import triton
@@ -176,10 +177,35 @@ def clear_plan_cache():
     _ZERO_CACHE.clear()
 
 
+_CU_HOST: dict = {}
+
+
+def cu_host_list(cu_seqlens) -> list:
+    """Host copy of cu_seqlens, read ONCE per packing.
+
+    Every Mamba layer of a step (fwd and bwd) receives the same cu_seqlens
+    tensor, so the copy is cached on the tensor's identity: a weakref (the
+    entry dies with the tensor, so a recycled id() never aliases) plus its
+    version counter (an in-place write invalidates it). One device sync per
+    step instead of two per layer per direction.
+    """
+    key = id(cu_seqlens)
+    hit = _CU_HOST.get(key)
+    if hit is not None:
+        ref, version, values = hit
+        if ref() is cu_seqlens and version == cu_seqlens._version:
+            return values
+    values = cu_seqlens.tolist()
+    if len(_CU_HOST) >= _CACHE_MAX:
+        _CU_HOST.pop(next(iter(_CU_HOST)))
+    _CU_HOST[key] = (weakref.ref(cu_seqlens), cu_seqlens._version, values)
+    return values
+
+
 def get_plan(cu_seqlens, chunk, scan_block):
     """Cached `build_plan`. All 29 Mamba layers of a step share one packing,
     so the build happens once per step rather than 29 times."""
-    cu_list = cu_seqlens.tolist()
+    cu_list = cu_host_list(cu_seqlens)
     key = (tuple(cu_list), chunk, scan_block, str(cu_seqlens.device))
     pl = _PLAN_CACHE.get(key)
     if pl is None:
@@ -239,7 +265,7 @@ def two_level_pays(cu_seqlens, nheads, device) -> bool:
     Cached per packing (all layers of a step share it); the cu_seqlens read
     is the same host sync get_plan() already does.
     """
-    cu = cu_seqlens.tolist()
+    cu = cu_host_list(cu_seqlens)
     key = (tuple(cu), nheads, str(device))
     hit = _SPLIT_CACHE.get(key)
     if hit is None:
