@@ -471,7 +471,7 @@ def mamba_mimo_fwd(
                 # (loaded unconditionally: rotary K feeds the state update)
                 angles_frag = T.alloc_fragment([chunk_size, N//rotary_dim_divisor], T.float32)
                 T.copy(ANGLES[i_b, chunk_start:chunk_start+chunk_size, i_h, :], angles_frag)
-                if not state_only:  # PASS A skips: rotary-Q apply + interchunk GEMM
+                if compute_outputs and not state_only:  # state-only passes skip: rotary-Q apply + interchunk GEMM
 
                     for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
                         q_shared[cs*R + r, n] = T.cos(angles_frag[cs, n]) * q_first_half_frag[cs, r, n] - T.sin(angles_frag[cs, n]) * q_second_half_frag[cs, r, n]

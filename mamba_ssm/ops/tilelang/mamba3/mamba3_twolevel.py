@@ -26,7 +26,7 @@ those, so it cannot observe how Out was computed. Gradients are therefore
 bit-identical to stock for identical inputs and identical dout; tests assert
 exactly that.
 
-DISABLED BY DEFAULT. `scan_block=0` (or M3_SCAN_BLOCK unset) takes the stock
+ON BY DEFAULT (scan_block 32) where it pays (see two_level_pays); M3_SCAN_BLOCK=0 takes the stock
 path untouched, so this is reversible without redeploying code.
 """
 
@@ -222,6 +222,34 @@ def scan_block_from_env(default=0):
         return int(os.environ.get("M3_SCAN_BLOCK", default))
     except ValueError:
         return default
+
+
+_SPLIT_CACHE: dict = {}
+
+
+def two_level_pays(cu_seqlens, nheads, device) -> bool:
+    """Whether the block decomposition beats the stock scan for this packing.
+
+    The stock scan's time is set by its longest serial chain (one block per
+    (head, segment) walking L_max tokens); its throughput floor is the total
+    work spread over the SMs (S_total * H / #SM). Splitting only pays when the
+    chain is the bottleneck, L_max * #SM > S_total * H. GH200, H=12,
+    S=65536: 2x32768 (ratio 5.5) 85.7 -> 19.2 ms fwd+bwd, one 20k doc + 45
+    short (3.4) 59.5 -> 24.0, 64x1024 (0.17) 23.2 -> 25.8 if split anyway.
+    Cached per packing (all layers of a step share it); the cu_seqlens read
+    is the same host sync get_plan() already does.
+    """
+    cu = cu_seqlens.tolist()
+    key = (tuple(cu), nheads, str(device))
+    hit = _SPLIT_CACHE.get(key)
+    if hit is None:
+        if len(_SPLIT_CACHE) >= _CACHE_MAX:
+            _SPLIT_CACHE.pop(next(iter(_SPLIT_CACHE)))
+        l_max = max((b - a for a, b in zip(cu[:-1], cu[1:])), default=0)
+        n_sm = torch.cuda.get_device_properties(device).multi_processor_count
+        hit = l_max * n_sm > cu[-1] * nheads
+        _SPLIT_CACHE[key] = hit
+    return hit
 
 
 def two_level_forward(fwd_fn, kwargs, scan_block):

@@ -22,14 +22,16 @@ from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo_fwd_varlen import mamba_mimo_forw
 from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo_bwd import mamba_mimo_bwd_combined
 from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo_bwd_varlen import mamba_mimo_bwd_combined_varlen
 
-# Two-level (block-decomposed) scan. OFF unless M3_SCAN_BLOCK is set to a
-# positive value, in which case it is bitwise-identical to stock. 32 is the
-# measured optimum at chunk_size 16.
+# Two-level (block-decomposed) scan, ON by default with scan_block 32 (the
+# measured optimum at chunk_size 16), used per packing only where it pays
+# (two_level_pays: the longest segment, not the total work, bounds the stock
+# scan). M3_SCAN_BLOCK=0 forces the stock scan everywhere.
 from mamba_ssm.ops.tilelang.mamba3.mamba3_twolevel import (
     scan_block_from_env,
     two_level_forward,
+    two_level_pays,
 )
-_M3_SCAN_BLOCK = scan_block_from_env(0)
+_M3_SCAN_BLOCK = scan_block_from_env(32)
 
 
 # =============================================================================
@@ -128,13 +130,18 @@ class _Mamba3Function(torch.autograd.Function):
                 outproj_norm_weight=Out_Norm_Weight,
                 outproj_norm_eps=outproj_norm_eps,
             )
-            if _M3_SCAN_BLOCK > 0:
+            ctx.scan_block = (
+                _M3_SCAN_BLOCK
+                if _M3_SCAN_BLOCK > 0 and two_level_pays(cu_seqlens, V.shape[2], V.device)
+                else 0
+            )
+            if ctx.scan_block > 0:
                 # `initial_states` flows unchanged to BOTH passes: the kernel
                 # applies it only when blk_c0 == 0, so the segment's first block
                 # folds it into C_local (Pass A) and seeds from it (Pass C),
                 # while later blocks use the state Pass B propagated.
                 Out, Final_SSM_State, Final_K = two_level_forward(
-                    mamba_mimo_forward_varlen, _fwd_kwargs, _M3_SCAN_BLOCK)
+                    mamba_mimo_forward_varlen, _fwd_kwargs, ctx.scan_block)
             else:
                 Out, Final_SSM_State, Final_K = mamba_mimo_forward_varlen(**_fwd_kwargs)
 
@@ -234,7 +241,7 @@ class _Mamba3Function(torch.autograd.Function):
                     fuse_pregate_headwise_rms_norm=ctx.fuse_pregate_headwise_rms_norm,
                     outproj_norm_weight=Out_Norm_Weight,
                     outproj_norm_eps=ctx.outproj_norm_eps,
-                    scan_block=_M3_SCAN_BLOCK,
+                    scan_block=ctx.scan_block,
                 )
         else:
             DA_CS, DA_CS_REV, Segsum = compute_dacs_segsum_triton(ADT, ctx.chunk_size)
