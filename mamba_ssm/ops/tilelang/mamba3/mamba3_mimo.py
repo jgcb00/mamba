@@ -22,6 +22,15 @@ from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo_fwd_varlen import mamba_mimo_forw
 from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo_bwd import mamba_mimo_bwd_combined
 from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo_bwd_varlen import mamba_mimo_bwd_combined_varlen
 
+# Two-level (block-decomposed) scan. OFF unless M3_SCAN_BLOCK is set to a
+# positive value, in which case it is bitwise-identical to stock. 32 is the
+# measured optimum at chunk_size 16.
+from mamba_ssm.ops.tilelang.mamba3.mamba3_twolevel import (
+    scan_block_from_env,
+    two_level_forward,
+)
+_M3_SCAN_BLOCK = scan_block_from_env(0)
+
 
 # =============================================================================
 # Autograd Function
@@ -105,10 +114,11 @@ class _Mamba3Function(torch.autograd.Function):
 
         if cu_seqlens is not None:
             DA_CS, DA_CS_REV, Segsum = compute_dacs_segsum_triton_varlen(ADT, chunk_size, cu_seqlens=cu_seqlens)
-            Out, Final_SSM_State, Final_K = mamba_mimo_forward_varlen(
-                Q, K, V, Q_bias, K_bias, MIMO_V, MIMO_Out,
-                Z, D, MIMO_Z, Angles_Cumsum,
-                DA_CS, DA_CS_REV, DT, Trap, Segsum,
+            _fwd_kwargs = dict(
+                q=Q, k=K, v=V, q_bias=Q_bias, k_bias=K_bias,
+                mimo_v=MIMO_V, mimo_o=MIMO_Out,
+                z=Z, D=D, mimo_z=MIMO_Z, angles=Angles_Cumsum,
+                dA_cs=DA_CS, dA_cs_rev=DA_CS_REV, dt=DT, trap=Trap, segsum=Segsum,
                 cu_seqlens=cu_seqlens,
                 initial_states=(Input_SSM_State, Input_K_State, Input_V_State) if all_states_present else None,
                 return_state=return_state,
@@ -118,6 +128,15 @@ class _Mamba3Function(torch.autograd.Function):
                 outproj_norm_weight=Out_Norm_Weight,
                 outproj_norm_eps=outproj_norm_eps,
             )
+            if _M3_SCAN_BLOCK > 0:
+                # `initial_states` flows unchanged to BOTH passes: the kernel
+                # applies it only when blk_c0 == 0, so the segment's first block
+                # folds it into C_local (Pass A) and seeds from it (Pass C),
+                # while later blocks use the state Pass B propagated.
+                Out, Final_SSM_State, Final_K = two_level_forward(
+                    mamba_mimo_forward_varlen, _fwd_kwargs, _M3_SCAN_BLOCK)
+            else:
+                Out, Final_SSM_State, Final_K = mamba_mimo_forward_varlen(**_fwd_kwargs)
 
         else:
             DA_CS, DA_CS_REV, Segsum = compute_dacs_segsum_triton(ADT, chunk_size)
@@ -215,6 +234,7 @@ class _Mamba3Function(torch.autograd.Function):
                     fuse_pregate_headwise_rms_norm=ctx.fuse_pregate_headwise_rms_norm,
                     outproj_norm_weight=Out_Norm_Weight,
                     outproj_norm_eps=ctx.outproj_norm_eps,
+                    scan_block=_M3_SCAN_BLOCK,
                 )
         else:
             DA_CS, DA_CS_REV, Segsum = compute_dacs_segsum_triton(ADT, ctx.chunk_size)
