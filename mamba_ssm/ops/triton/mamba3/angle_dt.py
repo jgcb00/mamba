@@ -6,7 +6,21 @@ from torch import Tensor
 
 import triton
 import triton.language as tl
-from mamba_ssm.ops.triton.mamba3.utils import tanh_approx, sech2_approx
+
+
+# Rotary phases are a running sum over the whole sequence, so a per-token error in tanh accumulates: with the
+# hardware tanh.approx.f32 (rel. error ~5e-4) the angle is off by ~6e-4 rad after 32k tokens, 10x the fp32
+# summation error. An accurate tanh keeps training, prefill and the decode step (same formula, fp32 state
+# wrapped mod 2*pi) within ~5e-5 rad of the fp64 phase.
+@triton.jit
+def _tanh(x):
+    return tl.sigmoid(2.0 * x) * 2.0 - 1.0
+
+
+@triton.jit
+def _sech2(x):
+    t = _tanh(x)
+    return 1.0 - t * t
 
 
 # -----------------------------------------------------------------------------
@@ -92,7 +106,7 @@ def angle_dt_fwd_kernel(
         # Load angle (CHUNK_SIZE, BLOCK_D)
         angle_ptrs = ANGLE + (chunk_start + seq_range[:, None]) * stride_angle_seq + dim_range[None, :] * stride_angle_dim
         angle_vals = tl.load(angle_ptrs, mask=seq_mask[:, None] & dim_mask[None, :], other=0.0).to(tl.float32)
-        angle_vals = tanh_approx(angle_vals) * PI
+        angle_vals = _tanh(angle_vals) * PI
 
         # Load dt (CHUNK_SIZE,)
         dt_ptrs = DT + (chunk_start + seq_range) * stride_dt_seq
@@ -321,13 +335,13 @@ def angle_dt_bwd_kernel(
         # Load angle and dt
         angle_ptrs = ANGLE + (chunk_start + seq_range[:, None]) * stride_angle_seq + dim_range[None, :] * stride_angle_dim
         pretanh_angle_vals = tl.load(angle_ptrs, mask=seq_mask[:, None] & dim_mask[None, :], other=0.0).to(tl.float32)
-        angle_vals = tanh_approx(pretanh_angle_vals) * PI
+        angle_vals = _tanh(pretanh_angle_vals) * PI
 
         dt_ptrs = DT + (chunk_start + seq_range) * stride_dt_seq
         dt_vals = tl.load(dt_ptrs, mask=seq_mask, other=0.0).to(tl.float32)
 
         # Compute gradients: out = angle * dt
-        grad_angle_vals = grad_vals * dt_vals[:, None] * PI * sech2_approx(pretanh_angle_vals)
+        grad_angle_vals = grad_vals * dt_vals[:, None] * PI * _sech2(pretanh_angle_vals)
         grad_dt_vals = tl.sum(grad_vals * angle_vals, axis=1)
 
         # Store gradients
@@ -500,7 +514,7 @@ def _fwd_block_kernel(OUT, BLOCK_TOT, OFFSET, ANGLE, DT, CU, ns,
         sm = (t0 + r) < seq_len
         tok = s0 + t0 + r
         a = tl.load(ANGLE + tok[:, None] * s_ang_seq + h * s_ang_head + d[None, :], mask=sm[:, None] & dm[None, :], other=0.0)
-        a = tanh_approx(a.to(tl.float32)) * PI_C
+        a = _tanh(a.to(tl.float32)) * PI_C
         dtv = tl.load(DT + h * s_dt_head + tok * s_dt_seq, mask=sm, other=0.0).to(tl.float32)
         v = a * dtv[:, None]
         if PASS == 3:
@@ -577,9 +591,9 @@ def _bwd_block_kernel(GRAD_ANGLE, GRAD_DT, BLOCK_TOT, OFFSET, GRAD_OUT, ANGLE, D
             rev = csum[None, :] - tl.cumsum(g, axis=0) + g
             gv = rev + gstate[None, :]
             pre = tl.load(ANGLE + tok[:, None] * s_ang_seq + h * s_ang_head + d[None, :], mask=m2, other=0.0).to(tl.float32)
-            a = tanh_approx(pre) * PI_C
+            a = _tanh(pre) * PI_C
             dtv = tl.load(DT + h * s_dt_head + tok * s_dt_seq, mask=sm, other=0.0).to(tl.float32)
-            tl.store(GRAD_ANGLE + tok[:, None] * s_ang_seq + h * s_ang_head + d[None, :], gv * dtv[:, None] * PI_C * sech2_approx(pre), mask=m2)
+            tl.store(GRAD_ANGLE + tok[:, None] * s_ang_seq + h * s_ang_head + d[None, :], gv * dtv[:, None] * PI_C * _sech2(pre), mask=m2)
             tl.store(GRAD_DT + h * s_dt_head + tok * s_dt_seq, tl.sum(gv * a, axis=1), mask=sm)
             gstate = gstate + csum
 
