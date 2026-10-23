@@ -163,6 +163,7 @@ def mamba_mimo_fwd(
             states_accum_cast_shared = T.alloc_shared([N, P], dtype)
             qk_intrachunk_shared = T.alloc_shared([fused_chunk_size, fused_chunk_size], dtype)
             diag_scale_shared = T.alloc_shared([chunk_size], T.float32)
+            decay_shared = T.alloc_shared([chunk_size, chunk_size], T.float32)
 
             # --- Swizzling Annotation ---
             T.annotate_layout({
@@ -312,10 +313,17 @@ def mamba_mimo_fwd(
                 qk_intrachunk_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], dtype=accum_dtype)
                 T.gemm(q_shared, k_shared, qk_intrachunk_frag, transpose_B=True, clear_accum=True)
 
-                # Causal mask: earlier steps get the segment decay exp(da_cs[i] - da_cs[j]) (computed inline
-                # from DA_CS; SEGSUM is no longer read), the same step gets gamma / ts (the diagonal term).
+                # Causal mask: earlier steps get the segment decay exp(da_cs[i] - da_cs[j]) (from DA_CS; SEGSUM is
+                # no longer read), the same step gets gamma / ts (the diagonal term). The decay is first built as a
+                # [chunk_size, chunk_size] matrix and the mask reads it once per entry, like SEGSUM: indexing the 1-D
+                # da_cs at two different steps (csr_i//R, csr_j//R) inside the T.Parallel(fused_chunk_size,
+                # fused_chunk_size) loop compiles to wrong values (18 % rel. L2 vs fp64).
                 da_cs__or__exp_da_cs_shared = T.alloc_shared([chunk_size], T.float32)
                 T.copy(DA_CS[i_b, i_h, chunk_start:chunk_start+chunk_size], da_cs__or__exp_da_cs_shared)
+                decay_frag = T.alloc_fragment([chunk_size, chunk_size], T.float32)
+                for a, b in T.Parallel(chunk_size, chunk_size):
+                    decay_frag[a, b] = T.exp(T.min(da_cs__or__exp_da_cs_shared[a] - da_cs__or__exp_da_cs_shared[b], 0.0))
+                T.copy(decay_frag, decay_shared)
                 diag_frag = T.alloc_fragment([chunk_size], dtype=T.float32)
                 for cs in T.Parallel(chunk_size):
                     diag_frag[cs] = T.if_then_else(trap_scale_shared[cs] > 0.0, gamma_frag[cs] / trap_scale_shared[cs], 0.0)
@@ -325,7 +333,7 @@ def mamba_mimo_fwd(
                     qk_intrachunk_masked_frag[csr_i, csr_j] = T.if_then_else(
                         csr_i//R > csr_j//R,
                         qk_intrachunk_frag[csr_i, csr_j]
-                        * T.exp(T.min(da_cs__or__exp_da_cs_shared[csr_i//R] - da_cs__or__exp_da_cs_shared[csr_j//R], 0.0)),
+                        * decay_shared[csr_i//R, csr_j//R],
                         T.if_then_else(csr_i//R == csr_j//R,
                                        qk_intrachunk_frag[csr_i, csr_j] * diag_scale_shared[csr_i//R], 0.0))
 
