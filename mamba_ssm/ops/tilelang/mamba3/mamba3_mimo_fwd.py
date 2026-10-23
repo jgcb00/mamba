@@ -162,7 +162,7 @@ def mamba_mimo_fwd(
             v_shared = T.alloc_shared([chunk_size, P], dtype)
             states_accum_cast_shared = T.alloc_shared([N, P], dtype)
             qk_intrachunk_shared = T.alloc_shared([fused_chunk_size, fused_chunk_size], dtype)
-            qk_dot_full_shared = T.alloc_shared([fused_chunk_size, fused_chunk_size], dtype)
+            diag_scale_shared = T.alloc_shared([chunk_size], T.float32)
 
             # --- Swizzling Annotation ---
             T.annotate_layout({
@@ -176,7 +176,6 @@ def mamba_mimo_fwd(
                 qs_shared: tilelang.layout.make_swizzled_layout(qs_shared),
                 o_shared: tilelang.layout.make_swizzled_layout(o_shared),
                 states_accum_cast_shared: tilelang.layout.make_swizzled_layout(states_accum_cast_shared),
-                qk_dot_full_shared: tilelang.layout.make_swizzled_layout(qk_dot_full_shared),
                 qk_intrachunk_shared: tilelang.layout.make_swizzled_layout(qk_intrachunk_shared),
             })
             T.use_swizzle(10, "row")
@@ -263,27 +262,8 @@ def mamba_mimo_fwd(
                     k_frag[cs, r, n] += k_bias_frag[r, n]
                 T.copy(T.view(k_frag, shape=[fused_chunk_size, N]), k_shared)
 
-                # --- Cache Diagonal qk_dot Path ---
-                # Keep full qk_dot in shared memory because we reuse same-step R x R blocks later.
-                qk_dot_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], dtype=accum_dtype)
-                T.gemm(q_shared, k_shared, qk_dot_frag, transpose_B=True, clear_accum=True)
-                T.copy(qk_dot_frag, qk_dot_full_shared)
-                # Option B: extremely slow
-                # qk_dot_frag = T.alloc_fragment([chunk_size, R, R], dtype=accum_dtype)
-                # T.clear(qk_dot_frag)
-                # for cs, r_out, r_in in T.Parallel(chunk_size, R, R):
-                #     for n in T.serial(N):
-                #         qk_dot_frag[cs, r_out, r_in] += (
-                #             q_frag[cs, r_out, n] * k_frag[cs, r_in, n]
-                #         )
-                # T.copy(T.view(qk_dot_frag, shape=[fused_chunk_size, R]), qk_dot_shared)
-                # NOTE ("option C"): The following fails Tilelang compilation:
-                # qk_predot_frag = T.alloc_fragment([chunk_size, R, R, N], dtype)
-                # for cs, r_out, r_in, n in T.Parallel(chunk_size, R, R, N):
-                #     qk_predot_frag[cs, r_out, r_in, n] = q_frag[cs, r_out, n] * k_frag[cs, r_in, n]
-                # qk_dot_frag = T.alloc_fragment([chunk_size, R, R], dtype)
-                # T.reduce_sum(qk_predot_frag, qk_dot_frag, dim=-1, clear=True)
-                # T.copy(T.view(qk_dot_frag, shape=[fused_chunk_size, R]), qk_dot_shared)
+                # The same-token R x R (diagonal) block of the output is taken from the intrachunk GEMM
+                # below, q . (k * ts) scaled by gamma / ts, so no separate q . k^T GEMM is needed.
 
                 # --- Rotary Q + Interchunk Contribution ---
                 q_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
@@ -332,17 +312,22 @@ def mamba_mimo_fwd(
                 qk_intrachunk_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], dtype=accum_dtype)
                 T.gemm(q_shared, k_shared, qk_intrachunk_frag, transpose_B=True, clear_accum=True)
 
-                # Strictly causal mask over chunk steps (exclude same-step diagonal).
+                # Causal mask: earlier steps get the segment decay exp(da_cs[i] - da_cs[j]) (computed inline
+                # from DA_CS; SEGSUM is no longer read), the same step gets gamma / ts (the diagonal term).
                 da_cs__or__exp_da_cs_shared = T.alloc_shared([chunk_size], T.float32)
                 T.copy(DA_CS[i_b, i_h, chunk_start:chunk_start+chunk_size], da_cs__or__exp_da_cs_shared)
+                diag_frag = T.alloc_fragment([chunk_size], dtype=T.float32)
+                for cs in T.Parallel(chunk_size):
+                    diag_frag[cs] = T.if_then_else(trap_scale_shared[cs] > 0.0, gamma_frag[cs] / trap_scale_shared[cs], 0.0)
+                T.copy(diag_frag, diag_scale_shared)
                 qk_intrachunk_masked_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], dtype=dtype)
                 for csr_i, csr_j in T.Parallel(fused_chunk_size, fused_chunk_size):
                     qk_intrachunk_masked_frag[csr_i, csr_j] = T.if_then_else(
-                                                csr_i//R > csr_j//R, # NOTE: we do indeed want to exclude the diagonal
-                                                qk_intrachunk_frag[csr_i, csr_j] 
-                                                * T.exp(SEGSUM[i_b, i_h, i, csr_i//R, csr_j//R]),
-                                                0.0
-                                            )
+                        csr_i//R > csr_j//R,
+                        qk_intrachunk_frag[csr_i, csr_j]
+                        * T.exp(T.min(da_cs__or__exp_da_cs_shared[csr_i//R] - da_cs__or__exp_da_cs_shared[csr_j//R], 0.0)),
+                        T.if_then_else(csr_i//R == csr_j//R,
+                                       qk_intrachunk_frag[csr_i, csr_j] * diag_scale_shared[csr_i//R], 0.0))
 
                 # Exponentiate da_cs__or__exp_da_cs_shared so that later usage does not have to:
                 for cs in T.Parallel(chunk_size):
@@ -360,25 +345,12 @@ def mamba_mimo_fwd(
                 # Adding the two intermediate outputs together (interchunk += intrachunk)
                 T.gemm(qk_intrachunk_shared, PsiV_shared, o_mimo_accum_frag, clear_accum=False)
 
-                # --- Add Diagonal Terms (qk_dot and optional D) ---
-                qkdot_psiv_frag = T.alloc_fragment([chunk_size, R, P], dtype=dtype)
-                T.clear(qkdot_psiv_frag)
-                for cs, r_out, p in T.Parallel(chunk_size, R, P):
-                    for r_in in T.serial(R):
-                        qkdot_psiv_frag[cs, r_out, p] += qk_dot_full_shared[cs * R + r_out, cs * R + r_in] * PsiV_shared[cs * R + r_in, p]                    
-                    qkdot_psiv_frag[cs, r_out, p] *= gamma_frag[cs] # Apply shifted gamma
-
+                # --- D skip (the diagonal qk term is already in the intrachunk GEMM) ---
                 if hasD:
-                    PsiV_D_frag = T.alloc_fragment([chunk_size, R, P], T.float32)
-                    for cs, r, p in T.Parallel(chunk_size, R, P):
-                        PsiV_D_frag[cs, r, p] = PsiV_shared[cs * R + r, p]
                     D_var = T.alloc_var(T.float32)
                     T.copy(D[i_h], D_var)
-                    for cs, r_out, p in T.Parallel(chunk_size, R, P):
-                        qkdot_psiv_frag[cs, r_out, p] += D_var * PsiV_D_frag[cs, r_out, p]
-                qkdot_psiv_reshaped_frag = T.view(qkdot_psiv_frag, shape=[fused_chunk_size, P])
-                for csr, p in T.Parallel(fused_chunk_size, P):
-                    o_mimo_accum_frag[csr, p] += qkdot_psiv_reshaped_frag[csr, p]
+                    for csr, p in T.Parallel(fused_chunk_size, P):
+                        o_mimo_accum_frag[csr, p] += D_var * PsiV_shared[csr, p]
 
                 # --- Optional Z Gating + Down-Projection ---
                 if reduceO:
